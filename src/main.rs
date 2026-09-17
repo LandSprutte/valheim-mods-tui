@@ -1,10 +1,13 @@
 //! A terminal browser for Valheim 1.0 mods on Thunderstore.
 
 mod app;
+mod compose;
 mod config;
 mod index;
 mod install;
+mod installed;
 mod thunderstore;
+mod update;
 mod ui;
 #[cfg(test)]
 mod ui_tests;
@@ -26,21 +29,38 @@ valheim-mods-tui — browse and install Valheim 1.0 mods from Thunderstore
 
 usage:
   valheim-mods-tui [--install-dir <path>]
+  valheim-mods-tui --update
 
 options:
   --install-dir <path>   Valheim server root, its BepInEx directory, or the
                          plugins directory. Saved for subsequent runs.
+  --update               Replace this binary with the newest published build.
+  --update-source <src>  Where updates come from: a GitHub \"owner/repo\" whose
+                         releases carry per-platform assets, or a direct URL.
+                         Saved, so --update alone works afterwards.
+  --force                With --update, reinstall even if the version matches.
+  --compose <file>       docker-compose.yml or .env that the exported MODS
+                         list is written into. Saved for subsequent runs.
+  --compose-service <s>  Which compose service to edit (default: the first with
+                         an environment block).
   --print-config         Show the resolved paths and exit.
+  -V, --version          Print the version and target triple.
   -h, --help             Show this help.
 
-The install directory is remembered in the config file, so it only needs to be
-passed once. VALHEIM_INSTALL_DIR overrides it for a single run.
+Paths and the update source are remembered in the config file, so each only
+needs to be passed once. VALHEIM_INSTALL_DIR overrides the install directory
+for a single run.
 ";
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut cli_dir: Option<PathBuf> = None;
     let mut print_config = false;
+    let mut do_update = false;
+    let mut force = false;
+    let mut cli_update_source: Option<String> = None;
+    let mut cli_compose: Option<PathBuf> = None;
+    let mut cli_service: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,7 +71,34 @@ fn main() -> Result<()> {
                     std::process::exit(2);
                 }
             }
+            "--update" => do_update = true,
+            "--force" => force = true,
+            "--update-source" => {
+                cli_update_source = args.next();
+                if cli_update_source.is_none() {
+                    eprintln!("--update-source needs a GitHub \"owner/repo\" or a URL");
+                    std::process::exit(2);
+                }
+            }
+            "--compose" => {
+                cli_compose = args.next().map(PathBuf::from);
+                if cli_compose.is_none() {
+                    eprintln!("--compose needs a path to a docker-compose.yml or .env");
+                    std::process::exit(2);
+                }
+            }
+            "--compose-service" => {
+                cli_service = args.next();
+                if cli_service.is_none() {
+                    eprintln!("--compose-service needs a service name");
+                    std::process::exit(2);
+                }
+            }
             "--print-config" => print_config = true,
+            "-V" | "--version" => {
+                println!("valheim-mods-tui {} ({})", update::VERSION, update::TARGET);
+                return Ok(());
+            }
             "-h" | "--help" => {
                 print!("{USAGE}");
                 return Ok(());
@@ -64,12 +111,43 @@ fn main() -> Result<()> {
     }
 
     let mut cfg = Config::load();
-    // A path given on the command line becomes the new default.
+    // Values given on the command line become the new defaults.
+    let mut dirty = false;
     if let Some(dir) = cli_dir {
         cfg.install_dir = Some(dir);
+        dirty = true;
+    }
+    if let Some(path) = cli_compose {
+        cfg.compose_file = Some(path);
+        dirty = true;
+    }
+    if let Some(service) = cli_service {
+        cfg.compose_service = Some(service);
+        dirty = true;
+    }
+    if let Some(src) = cli_update_source {
+        // Validated before saving so a typo cannot be persisted.
+        update::parse_source(&src)?;
+        cfg.update_source = Some(src);
+        dirty = true;
+    }
+    if dirty {
         if let Err(e) = cfg.save() {
             eprintln!("warning: could not save config: {e:#}");
         }
+    }
+
+    if do_update {
+        let source = std::env::var("VALHEIM_MODS_TUI_UPDATE_SOURCE")
+            .ok()
+            .or_else(|| cfg.update_source.clone());
+        return match source {
+            Some(src) => update::run(&src, force),
+            None => {
+                eprintln!("{}", update::unconfigured_hint());
+                std::process::exit(2);
+            }
+        };
     }
 
     let chosen = std::env::var("VALHEIM_INSTALL_DIR")
@@ -90,7 +168,19 @@ fn main() -> Result<()> {
     }
 
     if print_config {
+        println!("version:      {} ({})", update::VERSION, update::TARGET);
         println!("config file:  {}", config::config_path().display());
+        println!(
+            "update src:   {}",
+            cfg.update_source.as_deref().unwrap_or("not configured")
+        );
+        println!(
+            "compose file: {}",
+            cfg.compose_file
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not configured".into())
+        );
         println!("cache file:   {}", thunderstore::cache_path().display());
         match &layout {
             Some(l) => {

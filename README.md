@@ -38,6 +38,46 @@ valheim-mods-tui --install-dir /opt/valheim/server
 The path can be the server root, its `BepInEx` directory, or the `plugins`
 directory — all three are understood. `--print-config` shows what got resolved.
 
+## Updating
+
+The binary can replace itself, which matters on a VPS where there is no package
+manager or Rust toolchain involved:
+
+```sh
+valheim-mods-tui --update
+```
+
+Tell it once where builds come from, and it remembers:
+
+```sh
+# GitHub releases — picks the asset matching this machine's target triple
+valheim-mods-tui --update-source landsprutte/valheim-mods-tui
+
+# or any static host serving a binary for this platform
+valheim-mods-tui --update-source https://files.example/valheim-mods-tui
+```
+
+`VALHEIM_MODS_TUI_UPDATE_SOURCE` overrides it for one run, and `--force`
+reinstalls even when the version already matches. `--version` prints the build
+and its target triple.
+
+Updating is deliberately cautious. The download is rejected unless it is a
+native executable for this platform, so a rate-limit page or a 404 body can
+never land on top of a working binary. The replacement is then staged beside the
+target, **run once with `--version` to prove it works**, and only then renamed
+into place — an atomic swap, and the only way to overwrite a running executable
+on Linux. If any step fails, the staged file is removed and the current binary
+is untouched. Installing into a system directory needs the usual privileges;
+the error says so rather than failing obscurely.
+
+If you publish via GitHub, `.github/workflows/release.yml` builds all three
+targets and uploads them under the names `--update` looks for. Push a tag to
+trigger it:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
 ## Keys
 
 | key | action |
@@ -50,6 +90,10 @@ directory — all three are understood. `--print-config` shows what got resolved
 | `Space` | select or deselect a mod |
 | `c` | clear the selection |
 | `Enter` | install the selection and its dependencies |
+| `d` | *(in the confirm dialog)* install into a different folder |
+| `e` | export the selection as a `MODS=` list |
+| `w` | *(in the export dialog)* write `MODS` into your compose or `.env` file |
+| `i` | show only mods already installed here |
 | `/` | search name, author and description |
 | `f` | cycle the 1.0 compatibility filter |
 | `s` | sort by downloads, rating, updated or name |
@@ -97,6 +141,12 @@ Archives are unpacked following Thunderstore's layout conventions:
 | `monomod/…` | `BepInEx/monomod/<Owner-Mod>/` |
 | `core/…`, `config/…` | `BepInEx/core/`, `BepInEx/config/` |
 
+The destination defaults to the configured BepInEx directory, and the confirm
+dialog shows exactly where files will land. Press **`d`** there to install
+somewhere else — a server root, a `BepInEx` directory, or a `plugins` directory
+are all understood, and the choice is saved for next time. An unusable path is
+reported and the previous one kept.
+
 Each mod gets its own folder under `plugins/` so installs stay separable. Shell
 scripts are made executable on extraction — BepInEx ships its launch scripts as
 non-executable, so they would otherwise land unrunnable.
@@ -133,6 +183,81 @@ take effect — with no error to tell you so. Point your unit at
 update) or export those four variables in your own script.
 
 Restart the server after installing. Mods are only read at startup.
+
+## Seeing what is already installed
+
+When an install directory is configured, the TUI reads it on start and marks
+each mod's state:
+
+| mark | meaning |
+| --- | --- |
+| `●` | installed, at the latest published version |
+| `▲` | installed at a different version — the row shows `have <version>` |
+| *(blank)* | not installed here |
+
+The details pane names the version and which BepInEx directory it sits in, and
+`i` narrows the list to just what is installed. That view deliberately ignores
+the 1.0 filter: a mod on disk is worth seeing whether or not it signals 1.0
+support — libraries pulled in as dependencies often predate the release.
+
+Installed state is detected from the per-mod folders under `BepInEx/plugins`,
+`patchers` and `monomod`, with the version read from each `manifest.json`;
+BepInEx itself is recognised by its core assembly. Mods placed by another
+manager may use different folder names and will not be recognised. The list
+refreshes itself after an install, so the marks are never stale.
+
+## Docker servers that install mods themselves
+
+Several Valheim server images do not want plugin files at all — they take a list
+of Thunderstore mods and install them on start. Copying files into a host folder
+does nothing for those, because the server's filesystem is inside the container.
+
+Press **`e`** to export your selection as Thunderstore dependency strings. It
+resolves dependencies the same way installing does, writes `valheim-mods.env`,
+and shows the list on screen:
+
+```
+BEPINEXPACK_VERSION=5.4.2350
+MODS=ValheimModding-JsonDotNET-13.0.4,ValheimModding-Jotunn-2.30.0,RandyKnapp-EpicLoot-0.14.7
+```
+
+Press **`w`** and it writes those straight into your `docker-compose.yml` or
+`.env`. A `docker-compose.yml`, `compose.yml` or `.env` in the working directory
+is found automatically; `--compose <file>` points at one elsewhere, and
+`--compose-service <name>` picks the service when the file has several.
+
+The edit is line-targeted rather than a YAML rewrite, so comments, indentation,
+quoting style and key order all survive — a typical result is a two-line diff:
+
+```diff
+       BEPINEX_ENABLED: "true"
++      MODS: "ValheimModding-JsonDotNET-13.0.4,RandyKnapp-EpicLoot-0.14.7"
++      BEPINEXPACK_VERSION: "5.4.2350"
+```
+
+Both `KEY: value` and `- KEY=value` styles are supported, and whichever the file
+already uses is kept. An existing `MODS` is replaced rather than duplicated, and
+the original is copied to `.bak` first. Nothing is written until you press `w`.
+If the service has no `environment:` block the edit is refused rather than
+guessed at — add one first.
+
+Then recreate the container; a plain restart will not pick up changed
+environment variables:
+
+```sh
+docker compose up -d --force-recreate
+```
+
+For `indifferentbroccoli/valheim-server-docker`, `MODS` also turns BepInEx on by
+itself; `BEPINEX_ENABLED=true` is the explicit switch, and `BEPINEXPACK_VERSION`
+pins the loader (its default trails the current release).
+
+The loader is deliberately kept out of `MODS` and reported separately — those
+images manage BepInEx through their own version setting, so listing it as a mod
+invites a version clash.
+
+Use `--install-dir` (writing real files) when the server reads a directory you
+control; use `e` when the image manages mods for you.
 
 ## Notes
 

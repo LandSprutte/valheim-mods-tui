@@ -9,6 +9,16 @@ pub struct Config {
     /// Valheim server root, its BepInEx directory, or the plugins directory —
     /// all three spellings are accepted and normalised on use.
     pub install_dir: Option<PathBuf>,
+    /// Where `--update` fetches new builds: "owner/repo" or a URL.
+    #[serde(default)]
+    pub update_source: Option<String>,
+    /// docker-compose.yml or .env that receives the MODS list.
+    #[serde(default)]
+    pub compose_file: Option<PathBuf>,
+    /// Which compose service to edit; defaults to the first with an
+    /// `environment:` block.
+    #[serde(default)]
+    pub compose_service: Option<String>,
 }
 
 pub fn config_path() -> PathBuf {

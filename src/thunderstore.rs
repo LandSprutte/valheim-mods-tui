@@ -60,7 +60,7 @@ impl Mod {
     /// Short marker shown in the list explaining why the mod qualified.
     pub fn signal(&self) -> &'static str {
         match (self.tagged_for_v1(), self.updated_since_v1()) {
-            (true, true) => "tagged+updated",
+            (true, true) => "tagged + updated",
             (true, false) => "tagged",
             (false, true) => "updated",
             (false, false) => "-",

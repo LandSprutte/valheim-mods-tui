@@ -185,6 +185,132 @@ fn enter_opens_a_confirmation_listing_dependencies() {
 }
 
 #[test]
+fn the_install_destination_can_be_changed_from_the_confirm_modal() {
+    let first = std::env::temp_dir().join(format!("vmt-dest-a-{}", std::process::id()));
+    let second = std::env::temp_dir().join(format!("vmt-dest-b-{}", std::process::id()));
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+
+    let mut app = app();
+    app.layout = Some(crate::config::Layout::resolve(&first).unwrap());
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Enter));
+
+    // The default destination is shown, with a way to change it.
+    let out = screen(&mut app);
+    assert!(out.contains("press d to install somewhere else"), "{out}");
+
+    app.on_key(key(KeyCode::Char('d')));
+    let out = screen(&mut app);
+    assert!(out.contains("esc cancels"), "input mode expected:\n{out}");
+
+    // Replace the path with the second directory.
+    for _ in 0..first.display().to_string().len() {
+        app.on_key(key(KeyCode::Backspace));
+    }
+    for c in second.display().to_string().chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Enter));
+
+    assert_eq!(app.layout.as_ref().unwrap().root, second);
+    // Still on the confirm step — changing the folder must not install.
+    assert!(matches!(app.modal, Modal::Confirm { .. }));
+    assert!(!app.busy);
+
+    std::fs::remove_dir_all(&first).ok();
+    std::fs::remove_dir_all(&second).ok();
+}
+
+#[test]
+fn a_bad_destination_is_reported_and_the_old_one_kept() {
+    let good = std::env::temp_dir().join(format!("vmt-dest-c-{}", std::process::id()));
+    std::fs::create_dir_all(&good).unwrap();
+    let mut app = app();
+    app.layout = Some(crate::config::Layout::resolve(&good).unwrap());
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Char('d')));
+
+    for _ in 0..good.display().to_string().len() {
+        app.on_key(key(KeyCode::Backspace));
+    }
+    for c in "/no/such/place/anywhere".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Enter));
+
+    assert!(app.status.contains("does not exist"), "got: {}", app.status);
+    assert_eq!(app.layout.as_ref().unwrap().root, good);
+    std::fs::remove_dir_all(&good).ok();
+}
+
+#[test]
+fn typing_a_destination_never_triggers_the_install() {
+    let dir = std::env::temp_dir().join(format!("vmt-dest-d-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut app = app();
+    app.layout = Some(crate::config::Layout::resolve(&dir).unwrap());
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Enter));
+    app.on_key(key(KeyCode::Char('d')));
+
+    // 'y' would confirm the install outside of input mode.
+    for c in "y/tmp".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    assert!(!app.busy, "install must not start while typing a path");
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.modal, Modal::Confirm { .. }), "esc leaves input, not the modal");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn w_writes_the_mod_list_into_a_compose_file() {
+    let dir = std::env::temp_dir().join(format!("vmt-compose-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let compose = dir.join("docker-compose.yml");
+    std::fs::write(
+        &compose,
+        "services:\n  valheim:\n    image: x\n    environment:\n      SERVER_NAME: \"mine\"\n",
+    )
+    .unwrap();
+
+    let mut app = App::blank(None, "unset".into());
+    app.export_dir = Some(dir.clone());
+    let mut jotunn = m("ValheimModding-Jotunn", &[], 999);
+    jotunn.version = "2.30.0".into();
+    app.handle_msg(Msg::Catalog(Ok(vec![jotunn])));
+
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('e')));
+
+    // The target is only offered, never written without the explicit key.
+    match &app.modal {
+        Modal::Export { target, applied, .. } => {
+            assert!(target.is_some(), "a compose file beside us should be offered");
+            assert!(applied.is_none(), "nothing may be written before w");
+        }
+        _ => panic!("expected the export modal"),
+    }
+    let before = std::fs::read_to_string(&compose).unwrap();
+    assert!(!before.contains("MODS"));
+
+    app.on_key(key(KeyCode::Char('w')));
+
+    let after = std::fs::read_to_string(&compose).unwrap();
+    assert!(after.contains("MODS: \"ValheimModding-Jotunn-2.30.0\""), "{after}");
+    assert!(after.contains("SERVER_NAME: \"mine\""), "other keys must survive");
+    // The original is recoverable.
+    let backup = std::fs::read_to_string(dir.join("docker-compose.yml.bak")).unwrap();
+    assert_eq!(backup, before);
+    assert!(screen(&mut app).contains("written into"), "the result must be shown");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn unpublished_dependencies_are_shown_but_not_selectable() {
     let mut app = app();
     app.on_key(key(KeyCode::Char('G'))); // Bigpack, lowest downloads
@@ -233,6 +359,202 @@ fn typing_in_search_never_triggers_an_install() {
 }
 
 #[test]
+fn the_cursor_row_is_marked_in_the_gutter() {
+    let mut app = app();
+    let out = screen(&mut app);
+    let rows: Vec<&str> = out.lines().collect();
+
+    // Exactly one bar, and it sits on the first mod row.
+    assert_eq!(out.matches('\u{258c}').count(), 1, "one cursor bar expected:\n{out}");
+    let marked = rows.iter().find(|l| l.contains('\u{258c}')).unwrap();
+    assert!(marked.contains("Torchless"), "bar must sit on the cursor row: {marked}");
+
+    // And it follows the cursor.
+    app.on_key(key(KeyCode::Char('j')));
+    let out = screen(&mut app);
+    let marked = out.lines().find(|l| l.contains('\u{258c}')).unwrap();
+    assert!(marked.contains("Corelib"), "bar did not follow the cursor: {marked}");
+}
+
+#[test]
+fn the_header_shows_the_cursor_position() {
+    let mut app = app();
+    assert!(screen(&mut app).contains("1/3"));
+    app.on_key(key(KeyCode::Char('G')));
+    assert!(screen(&mut app).contains("3/3"));
+}
+
+#[test]
+fn the_detail_pane_spells_out_what_the_1_0_signals_mean() {
+    let mut app = App::blank(None, "unset".into());
+    let mut tagged_only = m("Dev-Tagged", &[], 10);
+    tagged_only.date_updated = "2024-01-01T00:00:00Z".into();
+    tagged_only.categories = vec![crate::thunderstore::V1_CATEGORY.into()];
+    app.handle_msg(Msg::Catalog(Ok(vec![tagged_only])));
+
+    let out = screen(&mut app);
+    assert!(out.contains("works with Valheim 1.0?"), "{out}");
+    // The matched signal is explained in words, not just labelled.
+    assert!(out.contains("tagged by the author for Deep North"), "{out}");
+    // And so is the one that did not match, with its date.
+    assert!(out.contains("released 2024-01-01, before 1.0"), "{out}");
+    assert!(out.contains('\u{2713}') && out.contains('\u{2717}'), "tick and cross expected:\n{out}");
+}
+
+#[test]
+fn the_help_modal_explains_the_1_0_column() {
+    let mut app = app();
+    app.on_key(key(KeyCode::Char('?')));
+    let out = screen(&mut app);
+    assert!(out.contains("Deep North update"), "{out}");
+    assert!(out.contains("after the 1.0 launch"), "{out}");
+    assert!(out.contains("installed at another version"), "{out}");
+}
+
+#[test]
+fn e_exports_the_selection_as_thunderstore_dependency_strings() {
+    let dir = std::env::temp_dir().join(format!("vmt-export-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut app = App::blank(None, "unset".into());
+    app.export_dir = Some(dir.clone());
+    let mut bepinex = m("denikson-BepInExPack_Valheim", &[], 500);
+    bepinex.version = "5.4.2350".into();
+    let mut jotunn = m("ValheimModding-Jotunn", &["denikson-BepInExPack_Valheim"], 999);
+    jotunn.version = "2.30.0".into();
+    app.handle_msg(Msg::Catalog(Ok(vec![jotunn, bepinex])));
+
+    // Select Jotunn; its dependency must come along.
+    app.on_key(key(KeyCode::Char(' ')));
+    app.on_key(key(KeyCode::Char('e')));
+
+    let out = screen(&mut app);
+    assert!(out.contains("ValheimModding-Jotunn-2.30.0"), "{out}");
+    // BepInEx is the loader, surfaced separately rather than as a mod.
+    assert!(out.contains("BEPINEXPACK_VERSION=5.4.2350"), "{out}");
+    assert!(!out.contains("MODS=denikson"), "BepInEx must not be in the MODS list:\n{out}");
+
+    let file = std::fs::read_to_string(dir.join("valheim-mods.env")).unwrap();
+    assert!(file.contains("MODS=ValheimModding-Jotunn-2.30.0"), "{file}");
+    assert!(file.contains("BEPINEXPACK_VERSION=5.4.2350"), "{file}");
+    assert!(
+        !file.contains("MODS=denikson-BepInExPack_Valheim"),
+        "loader leaked into the mod list:\n{file}"
+    );
+
+    app.on_key(key(KeyCode::Char('x')));
+    assert!(matches!(app.modal, Modal::None));
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn exporting_with_nothing_selected_is_refused() {
+    let mut app = App::blank(None, "unset".into());
+    app.handle_msg(Msg::Catalog(Ok(vec![])));
+    app.on_key(key(KeyCode::Char('e')));
+    assert!(matches!(app.modal, Modal::None));
+    assert!(app.status.contains("nothing selected"), "got: {}", app.status);
+}
+
+/// Builds an app whose install directory already contains one of the mods.
+fn app_with_install(dir: &std::path::Path, folder: &str, version: Option<&str>) -> App {
+    let plugins = dir.join("BepInEx").join("plugins").join(folder);
+    std::fs::create_dir_all(&plugins).unwrap();
+    if let Some(v) = version {
+        std::fs::write(
+            plugins.join("manifest.json"),
+            format!(r#"{{"name":"x","version_number":"{v}"}}"#),
+        )
+        .unwrap();
+    }
+    let mut app = App::blank(
+        Some(crate::config::Layout::resolve(dir).unwrap()),
+        "set".into(),
+    );
+    app.rescan_installed();
+    app.handle_msg(Msg::Catalog(Ok(vec![
+        m("Dev-Torchless", &[], 900),
+        m("Dev-Corelib", &[], 500),
+    ])));
+    app
+}
+
+#[test]
+fn installed_mods_are_marked_in_the_list_and_details() {
+    let dir = std::env::temp_dir().join(format!("vmt-inst-a-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // m() builds every mod at version 1.0.0, so this copy is current.
+    let mut app = app_with_install(&dir, "Dev-Torchless", Some("1.0.0"));
+
+    let out = screen(&mut app);
+    assert!(out.contains("● Torchless"), "installed mod must be marked:\n{out}");
+    assert!(out.contains("○ not installed") || out.contains("● installed"), "{out}");
+    assert!(out.contains("1 installed"), "header should count them:\n{out}");
+    assert!(out.contains("● installed  1.0.0 in BepInEx/plugins"), "{out}");
+
+    // The uninstalled one says so plainly.
+    app.on_key(key(KeyCode::Char('j')));
+    let out = screen(&mut app);
+    assert!(out.contains("○ not installed here"), "{out}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_different_installed_version_is_flagged_rather_than_shown_as_current() {
+    let dir = std::env::temp_dir().join(format!("vmt-inst-b-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut app = app_with_install(&dir, "Dev-Torchless", Some("0.9.0"));
+
+    let out = screen(&mut app);
+    assert!(out.contains("▲ Torchless"), "stale install needs its own mark:\n{out}");
+    assert!(out.contains("have 0.9.0"), "{out}");
+    assert!(out.contains("▲ installed  0.9.0"), "{out}");
+    assert!(out.contains("latest is 1.0.0"), "{out}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn i_narrows_the_list_to_installed_mods() {
+    let dir = std::env::temp_dir().join(format!("vmt-inst-c-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut app = app_with_install(&dir, "Dev-Corelib", Some("1.0.0"));
+    assert_eq!(app.rows.len(), 2);
+
+    app.on_key(key(KeyCode::Char('i')));
+    assert_eq!(app.rows.len(), 1, "only the installed mod should remain");
+    assert_eq!(app.index.get(app.rows[0].mod_idx.unwrap()).full_name, "Dev-Corelib");
+    assert!(screen(&mut app).contains("only these"), "the filter must be visible");
+
+    app.on_key(key(KeyCode::Char('i')));
+    assert_eq!(app.rows.len(), 2, "toggling back restores the full list");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_mod_without_a_manifest_still_counts_as_installed() {
+    let dir = std::env::temp_dir().join(format!("vmt-inst-d-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut app = app_with_install(&dir, "Dev-Torchless", None);
+
+    // Unknown version must not be reported as out of date.
+    let out = screen(&mut app);
+    assert!(out.contains("● Torchless"), "{out}");
+    assert!(!out.contains("have "), "no version to compare against:\n{out}");
+    assert!(out.contains("● installed  in BepInEx/plugins"), "{out}");
+    assert!(!out.contains("latest is"), "unknown version is not staleness:\n{out}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn with_no_install_directory_nothing_is_marked_installed() {
+    let mut app = app();
+    assert!(app.installed.is_empty());
+    let out = screen(&mut app);
+    assert!(out.contains("0 installed"), "{out}");
+    assert!(!out.contains("●"), "nothing can be installed without a target:\n{out}");
+}
+
+#[test]
 fn the_help_modal_opens_and_any_key_closes_it() {
     let mut app = app();
     app.on_key(key(KeyCode::Char('?')));
@@ -253,6 +575,26 @@ fn the_filter_cycles_through_every_compatibility_view() {
     }
     assert_eq!(seen, ["1.0 ready", "tagged only", "updated only", "all mods"]);
     assert_eq!(app.filter.label(), "1.0 ready", "the cycle must return home");
+}
+
+#[test]
+fn the_help_modal_fits_a_short_terminal() {
+    let mut app = app();
+    app.on_key(key(KeyCode::Char('?')));
+    let mut term = Terminal::new(TestBackend::new(96, 26)).unwrap();
+    term.draw(|f| ui::draw(f, &mut app)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let out: String = (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The closing hint is the last line, so seeing it proves nothing clipped.
+    assert!(out.contains("press any key to close"), "help modal was cut off:\n{out}");
+    assert!(out.contains("not installed"), "{out}");
 }
 
 #[test]

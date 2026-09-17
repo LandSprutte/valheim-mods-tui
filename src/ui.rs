@@ -11,6 +11,8 @@ const ACCENT: Color = Color::Rgb(122, 162, 247);
 const DIM: Color = Color::Rgb(128, 135, 152);
 const GOOD: Color = Color::Rgb(158, 206, 106);
 const WARN: Color = Color::Rgb(224, 175, 104);
+/// Background of the row under the cursor.
+const CURSOR_BG: Color = Color::Rgb(54, 66, 106);
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::vertical([
@@ -33,7 +35,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match &app.modal {
         Modal::Help => help_modal(f),
-        Modal::Confirm { plan, missing } => confirm_modal(f, app, plan, missing),
+        Modal::Confirm {
+            plan,
+            missing,
+            editing,
+        } => confirm_modal(f, app, plan, missing, editing.as_deref()),
+        Modal::Export {
+            mods,
+            count,
+            bepinex,
+            written,
+            target,
+            applied,
+        } => export_modal(
+            f,
+            mods,
+            *count,
+            bepinex.as_deref(),
+            written,
+            target.as_deref(),
+            applied.as_ref(),
+        ),
         Modal::None => {}
     }
 }
@@ -56,6 +78,15 @@ fn header(f: &mut Frame, area: Rect, app: &App) {
             format!("{} selected", app.selected.len()),
             Style::new().fg(if app.selected.is_empty() { DIM } else { GOOD }),
         ),
+        Span::styled("  ·  ", Style::new().fg(DIM)),
+        Span::styled(
+            if app.installed_only {
+                format!("{} installed (only these)", app.installed.len())
+            } else {
+                format!("{} installed", app.installed.len())
+            },
+            Style::new().fg(if app.installed.is_empty() { DIM } else { GOOD }),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -64,7 +95,14 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(DIM))
-        .title(Span::styled(" mods ", Style::new().fg(ACCENT)));
+        .title(Span::styled(
+            if app.rows.is_empty() {
+                " mods ".to_string()
+            } else {
+                format!(" mods  {}/{} ", app.cursor + 1, app.rows.len())
+            },
+            Style::new().fg(ACCENT),
+        ));
     let inner = block.inner(area);
     app.page = inner.height.max(1) as usize;
 
@@ -81,8 +119,16 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .rows
         .iter()
-        .map(|row| {
-            let mut spans = Vec::new();
+        .enumerate()
+        .map(|(n, row)| {
+            // A solid bar in the gutter marks the cursor, so the current row
+            // stays obvious even where the background highlight is washed out
+            // by the terminal's colour scheme.
+            let on_cursor = n == app.cursor;
+            let mut spans = vec![Span::styled(
+                if on_cursor { "▌" } else { " " },
+                Style::new().fg(ACCENT),
+            )];
 
             match row.mod_idx {
                 Some(i) => {
@@ -103,11 +149,26 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
                         },
                         Style::new().fg(ACCENT),
                     ));
+                    // A status glyph in front of the name: present, or present
+                    // at a different version to the latest release.
+                    let state = app.installed_state(&m.full_name);
+                    let outdated = app.is_outdated(&m.full_name, &m.version);
+                    spans.push(match (state.is_some(), outdated) {
+                        (true, true) => Span::styled("▲ ", Style::new().fg(WARN)),
+                        (true, false) => Span::styled("● ", Style::new().fg(GOOD)),
+                        _ => Span::raw("  "),
+                    });
+
+                    let name_colour = if on_cursor {
+                        ACCENT
+                    } else if row.depth == 0 {
+                        Color::White
+                    } else {
+                        Color::Gray
+                    };
                     spans.push(Span::styled(
                         m.name.clone(),
-                        Style::new()
-                            .fg(if row.depth == 0 { Color::White } else { Color::Gray })
-                            .bold(),
+                        Style::new().fg(name_colour).bold(),
                     ));
                     spans.push(Span::styled(
                         format!(" {}", m.version),
@@ -122,6 +183,16 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
                             format!("  {}", m.signal()),
                             Style::new().fg(if m.tagged_for_v1() { GOOD } else { WARN }),
                         ));
+                    }
+                    if row.depth == 0 {
+                        if let Some(have) = state.and_then(|i| i.version.as_deref()) {
+                            if have != m.version {
+                                spans.push(Span::styled(
+                                    format!("  have {have}"),
+                                    Style::new().fg(WARN),
+                                ));
+                            }
+                        }
                     }
                     if row.cycle {
                         spans.push(Span::styled(
@@ -153,7 +224,7 @@ fn list(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(
         List::new(items)
             .block(block)
-            .highlight_style(Style::new().bg(Color::Rgb(41, 46, 66))),
+            .highlight_style(Style::new().bg(CURSOR_BG)),
         area,
         &mut state,
     );
@@ -190,12 +261,69 @@ fn detail(f: &mut Frame, area: Rect, app: &App) {
         Line::raw(""),
         Line::from(Span::raw(m.description.clone())),
         Line::raw(""),
-        field("updated", &m.date_updated[..10.min(m.date_updated.len())]),
         field("downloads", downloads(m.downloads)),
         field("rating", m.rating.to_string()),
         field("size", m.size_human()),
-        field("1.0 signal", m.signal()),
     ];
+
+    // State on disk comes first: it is the thing you act on.
+    match app.installed_state(&m.full_name) {
+        Some(have) => {
+            // An unreadable version is not evidence of being out of date, so it
+            // must not be dressed up as one.
+            let stale = have
+                .version
+                .as_deref()
+                .is_some_and(|v| v != m.version.as_str());
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if stale { "▲ installed  " } else { "● installed  " },
+                    Style::new().fg(if stale { WARN } else { GOOD }),
+                ),
+                Span::styled(
+                    match &have.version {
+                        Some(v) => format!("{v} in BepInEx/{}", have.location),
+                        None => format!("in BepInEx/{}", have.location),
+                    },
+                    Style::new().fg(Color::Gray),
+                ),
+            ]));
+            if stale {
+                lines.push(Line::from(Span::styled(
+                    format!("  latest is {} — enter reinstalls", m.version),
+                    Style::new().fg(WARN),
+                )));
+            }
+        }
+        None => lines.push(Line::from(Span::styled(
+            "○ not installed here",
+            Style::new().fg(DIM),
+        ))),
+    }
+    lines.push(Line::raw(""));
+
+    // Spell the compatibility signals out. "tagged"/"updated" is shorthand in
+    // the list; here it says what was actually checked and what it is worth.
+    let released = &m.date_updated[..10.min(m.date_updated.len())];
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "works with Valheim 1.0?",
+        Style::new().fg(ACCENT).bold(),
+    )));
+    lines.push(check(
+        m.tagged_for_v1(),
+        "tagged by the author for Deep North",
+        "not tagged by the author for Deep North",
+    ));
+    lines.push(check(
+        m.updated_since_v1(),
+        format!("released {released}, after 1.0"),
+        format!("released {released}, before 1.0"),
+    ));
+    lines.push(Line::from(Span::styled(
+        "Thunderstore publishes no verified-compatibility flag, so these are the only signals there are.",
+        Style::new().fg(DIM).italic(),
+    )));
 
     if !m.categories.is_empty() {
         lines.push(field("categories", m.categories.join(", ")));
@@ -237,6 +365,20 @@ fn detail(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// A pass/fail line for one compatibility signal.
+fn check(ok: bool, yes: impl Into<String>, no: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if ok { "  ✓ " } else { "  ✗ " },
+            Style::new().fg(if ok { GOOD } else { WARN }),
+        ),
+        Span::styled(
+            if ok { yes.into() } else { no.into() },
+            Style::new().fg(if ok { Color::Gray } else { DIM }),
+        ),
+    ])
+}
+
 fn field(label: &str, value: impl Into<String>) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<12}"), Style::new().fg(DIM)),
@@ -268,7 +410,7 @@ fn keys(f: &mut Frame, area: Rect, app: &App) {
     let text = if app.searching {
         "type to filter   enter accept   esc clear"
     } else {
-        "j/k move  h/l collapse/expand  space select  enter install  / search  f filter  s sort  r refresh  ? help  q quit"
+        "j/k move  h/l expand  space select  enter install  i installed  e export  / search  f filter  s sort  ? help  q quit"
     };
     f.render_widget(
         Paragraph::new(Span::styled(format!(" {text}"), Style::new().fg(DIM))),
@@ -279,7 +421,7 @@ fn keys(f: &mut Frame, area: Rect, app: &App) {
 fn centered(f: &Frame, w: u16, h: u16) -> Rect {
     let a = f.area();
     let width = w.min(a.width.saturating_sub(4));
-    let height = h.min(a.height.saturating_sub(4));
+    let height = h.min(a.height.saturating_sub(2));
     Rect {
         x: a.x + (a.width.saturating_sub(width)) / 2,
         y: a.y + (a.height.saturating_sub(height)) / 2,
@@ -298,16 +440,37 @@ fn help_modal(f: &mut Frame) {
         ("space", "select or deselect the mod"),
         ("c", "clear the whole selection"),
         ("enter", "install selection plus dependencies"),
+        ("e", "export the selection as a MODS= list"),
+        ("i", "show only mods already installed here"),
         ("/", "search name, author and description"),
         ("f", "cycle the 1.0 compatibility filter"),
         ("s", "cycle sort: downloads, rating, updated, name"),
         ("r", "re-fetch the catalogue from Thunderstore"),
         ("q / esc", "quit"),
     ];
-    let mut lines = vec![Line::raw("")];
+    let mut lines = Vec::new();
     for (k, v) in rows {
         lines.push(Line::from(vec![
             Span::styled(format!("  {k:<18}"), Style::new().fg(ACCENT).bold()),
+            Span::styled(v.to_string(), Style::new().fg(Color::Gray)),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(vec![
+        Span::styled("  ● ", Style::new().fg(GOOD)),
+        Span::styled("installed   ", Style::new().fg(Color::Gray)),
+        Span::styled("▲ ", Style::new().fg(WARN)),
+        Span::styled("installed at another version   ", Style::new().fg(Color::Gray)),
+        Span::styled("○ ", Style::new().fg(DIM)),
+        Span::styled("not installed", Style::new().fg(Color::Gray)),
+    ]));
+    for (k, v) in [
+        ("tagged", "the author tagged it for the Deep North update"),
+        ("updated", "it has a release dated after the 1.0 launch"),
+        ("tagged + updated", "both — see the details pane for dates"),
+    ] {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {k:<18}"), Style::new().fg(GOOD)),
             Span::styled(v.to_string(), Style::new().fg(Color::Gray)),
         ]));
     }
@@ -317,7 +480,7 @@ fn help_modal(f: &mut Frame) {
         Style::new().fg(DIM).italic(),
     )));
 
-    let area = centered(f, 66, lines.len() as u16 + 2);
+    let area = centered(f, 74, lines.len() as u16 + 2);
     f.render_widget(Clear, area);
     f.render_widget(
         Paragraph::new(lines).block(
@@ -330,7 +493,13 @@ fn help_modal(f: &mut Frame) {
     );
 }
 
-fn confirm_modal(f: &mut Frame, app: &App, plan: &[usize], missing: &[String]) {
+fn confirm_modal(
+    f: &mut Frame,
+    app: &App,
+    plan: &[usize],
+    missing: &[String],
+    editing: Option<&str>,
+) {
     let direct = app.selected.len().max(1);
     let target = app
         .layout
@@ -352,12 +521,32 @@ fn confirm_modal(f: &mut Frame, app: &App, plan: &[usize], missing: &[String]) {
             ),
         ]),
         Line::raw(""),
-        Line::from(vec![
-            Span::styled("  into  ", Style::new().fg(DIM)),
-            Span::styled(target, Style::new().fg(Color::White)),
-        ]),
-        Line::raw(""),
     ];
+
+    match editing {
+        Some(buf) => {
+            lines.push(Line::from(vec![
+                Span::styled("  into  ", Style::new().fg(DIM)),
+                Span::styled(buf.to_string(), Style::new().fg(Color::White)),
+                Span::styled("▏", Style::new().fg(ACCENT)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "  server root, BepInEx dir or plugins dir — enter accepts, esc cancels",
+                Style::new().fg(DIM).italic(),
+            )));
+        }
+        None => {
+            lines.push(Line::from(vec![
+                Span::styled("  into  ", Style::new().fg(DIM)),
+                Span::styled(target, Style::new().fg(Color::White)),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "         press d to install somewhere else",
+                Style::new().fg(DIM).italic(),
+            )));
+        }
+    }
+    lines.push(Line::raw(""));
 
     for &i in plan.iter().take(10) {
         let m = app.index.get(i);
@@ -402,12 +591,16 @@ fn confirm_modal(f: &mut Frame, app: &App, plan: &[usize], missing: &[String]) {
     }
 
     lines.push(Line::raw(""));
-    lines.push(Line::from(vec![
-        Span::styled("  enter/y ", Style::new().fg(Color::Black).bg(GOOD).bold()),
-        Span::styled(" install    ", Style::new().fg(DIM)),
-        Span::styled(" any other key ", Style::new().fg(Color::Black).bg(DIM)),
-        Span::styled(" cancel", Style::new().fg(DIM)),
-    ]));
+    if editing.is_none() {
+        lines.push(Line::from(vec![
+            Span::styled("  enter/y ", Style::new().fg(Color::Black).bg(GOOD).bold()),
+            Span::styled(" install   ", Style::new().fg(DIM)),
+            Span::styled(" d ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+            Span::styled(" change folder   ", Style::new().fg(DIM)),
+            Span::styled(" any other key ", Style::new().fg(Color::Black).bg(DIM)),
+            Span::styled(" cancel", Style::new().fg(DIM)),
+        ]));
+    }
 
     let area = centered(f, 78, lines.len() as u16 + 2);
     f.render_widget(Clear, area);
@@ -425,6 +618,145 @@ fn confirm_modal(f: &mut Frame, app: &App, plan: &[usize], missing: &[String]) {
 /// Renders a count with the right singular or plural noun.
 fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// Shows the dependency-string list and where it was saved.
+#[allow(clippy::too_many_arguments)]
+fn export_modal(
+    f: &mut Frame,
+    mods: &str,
+    count: usize,
+    bepinex: Option<&str>,
+    written: &Result<String, String>,
+    target: Option<&std::path::Path>,
+    applied: Option<&Result<String, String>>,
+) {
+    let width = 86u16;
+    let wrap_at = width.saturating_sub(8) as usize;
+
+    let mut lines = vec![
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("  ", Style::new()),
+            Span::styled(
+                format!("{count} mods"),
+                Style::new().fg(GOOD).bold(),
+            ),
+            Span::styled(
+                " as Thunderstore dependency strings, for server images",
+                Style::new().fg(Color::Gray),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "  that install mods themselves (a MODS= list) rather than from files.",
+            Style::new().fg(Color::Gray),
+        )),
+        Line::raw(""),
+    ];
+
+    if let Some(v) = bepinex {
+        lines.push(Line::from(vec![
+            Span::styled("  BEPINEXPACK_VERSION=", Style::new().fg(ACCENT)),
+            Span::styled(v.to_string(), Style::new().fg(Color::White)),
+        ]));
+        lines.push(Line::raw(""));
+    }
+
+    lines.push(Line::from(Span::styled(
+        "  MODS=",
+        Style::new().fg(ACCENT),
+    )));
+    // Wrapped by hand so the list stays readable and copyable on screen.
+    for chunk in wrap_chunks(mods, wrap_at) {
+        lines.push(Line::from(Span::styled(
+            format!("    {chunk}"),
+            Style::new().fg(Color::White),
+        )));
+    }
+
+    lines.push(Line::raw(""));
+    match written {
+        Ok(path) => lines.push(Line::from(vec![
+            Span::styled("  saved to  ", Style::new().fg(DIM)),
+            Span::styled(path.clone(), Style::new().fg(Color::Gray)),
+        ])),
+        Err(e) => lines.push(Line::from(Span::styled(
+            format!("  could not save the file: {e}"),
+            Style::new().fg(WARN),
+        ))),
+    }
+    // Offer to put the list straight into the compose or env file.
+    match (applied, target) {
+        (Some(Ok(where_)), _) => {
+            lines.push(Line::from(Span::styled(
+                format!("  ✓ written into {where_}"),
+                Style::new().fg(GOOD),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  recreate the container to apply: docker compose up -d --force-recreate",
+                Style::new().fg(DIM).italic(),
+            )));
+        }
+        (Some(Err(e)), _) => lines.push(Line::from(Span::styled(
+            format!("  ✗ {e}"),
+            Style::new().fg(WARN),
+        ))),
+        (None, Some(path)) => {
+            lines.push(Line::from(vec![
+                Span::styled("  w ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+                Span::styled(
+                    format!(" write MODS into {}", path.display()),
+                    Style::new().fg(Color::Gray),
+                ),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "      the original is kept as a .bak alongside it",
+                Style::new().fg(DIM).italic(),
+            )));
+        }
+        (None, None) => lines.push(Line::from(Span::styled(
+            "  no docker-compose.yml or .env here — pass --compose <file> to write one",
+            Style::new().fg(DIM).italic(),
+        ))),
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  press any other key to close",
+        Style::new().fg(DIM).italic(),
+    )));
+
+    let area = centered(f, width, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(ACCENT))
+                .title(Span::styled(" mod list ", Style::new().fg(ACCENT).bold())),
+        ),
+        area,
+    );
+}
+
+/// Splits a long comma-separated list into display-width chunks, breaking
+/// after commas so no dependency string is cut in half.
+fn wrap_chunks(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut line = String::new();
+    for part in text.split_inclusive(',') {
+        if !line.is_empty() && line.len() + part.len() > width {
+            out.push(std::mem::take(&mut line));
+        }
+        line.push_str(part);
+    }
+    if !line.is_empty() {
+        out.push(line);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 fn downloads(n: u64) -> String {

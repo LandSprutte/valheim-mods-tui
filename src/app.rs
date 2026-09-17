@@ -3,9 +3,10 @@
 use crate::config::Layout;
 use crate::index::{build_rows, Filter, Index, Row, Sort};
 use crate::install;
+use crate::installed::{self, Installed};
 use crate::thunderstore::{self, Mod};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 
 /// Messages sent from background workers to the UI thread.
@@ -20,7 +21,24 @@ pub enum Msg {
 pub enum Modal {
     None,
     Help,
-    Confirm { plan: Vec<usize>, missing: Vec<String> },
+    Confirm {
+        plan: Vec<usize>,
+        missing: Vec<String>,
+        /// Set while the destination is being typed.
+        editing: Option<String>,
+    },
+    /// The selection rendered as a Thunderstore dependency list, for server
+    /// images that install mods themselves.
+    Export {
+        mods: String,
+        count: usize,
+        bepinex: Option<String>,
+        written: Result<String, String>,
+        /// A docker-compose.yml or .env that MODS can be written into.
+        target: Option<std::path::PathBuf>,
+        /// Outcome of writing to that target, once attempted.
+        applied: Option<Result<String, String>>,
+    },
 }
 
 pub struct App {
@@ -42,6 +60,12 @@ pub struct App {
     pub modal: Modal,
     pub layout: Option<Layout>,
     pub install_dir_hint: String,
+    /// Where the exported mod list is written; the working directory by default.
+    pub export_dir: Option<std::path::PathBuf>,
+    /// Mods already present in the configured install, by full name.
+    pub installed: HashMap<String, Installed>,
+    /// Restrict the list to mods that are already installed.
+    pub installed_only: bool,
     pub quit: bool,
     tx: Sender<Msg>,
     pub rx: Receiver<Msg>,
@@ -52,6 +76,7 @@ pub struct App {
 impl App {
     pub fn new(layout: Option<Layout>, install_dir_hint: String) -> Self {
         let mut app = App::blank(layout, install_dir_hint);
+        app.rescan_installed();
         app.spawn_load(false);
         app
     }
@@ -76,6 +101,9 @@ impl App {
             modal: Modal::None,
             layout,
             install_dir_hint,
+            export_dir: None,
+            installed: HashMap::new(),
+            installed_only: false,
             quit: false,
             tx,
             rx,
@@ -93,8 +121,39 @@ impl App {
         });
     }
 
+    /// Re-reads the install directory. Cheap enough to run after every install.
+    pub fn rescan_installed(&mut self) {
+        self.installed = match &self.layout {
+            Some(l) => installed::scan(l),
+            None => HashMap::new(),
+        };
+    }
+
+    /// The installed record for a mod, if it is present on disk.
+    pub fn installed_state(&self, full_name: &str) -> Option<&Installed> {
+        self.installed.get(full_name)
+    }
+
+    /// True when the installed copy is a different version to the latest.
+    pub fn is_outdated(&self, full_name: &str, latest: &str) -> bool {
+        match self.installed.get(full_name).and_then(|i| i.version.as_deref()) {
+            Some(v) => v != latest,
+            None => false,
+        }
+    }
+
     pub fn rebuild(&mut self) {
-        let roots = self.index.roots(self.filter, &self.query, self.sort);
+        // Showing what is installed ignores the compatibility filter: a mod on
+        // disk is worth seeing whether or not it signals 1.0 support.
+        let filter = if self.installed_only {
+            Filter::All
+        } else {
+            self.filter
+        };
+        let mut roots = self.index.roots(filter, &self.query, self.sort);
+        if self.installed_only {
+            roots.retain(|&i| self.installed.contains_key(&self.index.get(i).full_name));
+        }
         self.rows = build_rows(&self.index, &roots, &self.expanded);
         if self.cursor >= self.rows.len() {
             self.cursor = self.rows.len().saturating_sub(1);
@@ -147,6 +206,9 @@ impl App {
                     Ok(summary) => {
                         self.status = summary.clone();
                         self.log.push(summary);
+                        // Reflect the new files immediately in the list.
+                        self.rescan_installed();
+                        self.rebuild();
                     }
                     Err(e) => {
                         self.status = format!("install failed: {e}");
@@ -165,13 +227,37 @@ impl App {
                 self.modal = Modal::None;
                 return;
             }
-            Modal::Confirm { .. } => {
+            Modal::Export { target, .. } => {
+                // `w` commits the list to the compose or env file.
+                if matches!(key.code, KeyCode::Char('w')) && target.is_some() {
+                    self.write_mods_to_target();
+                } else {
+                    self.modal = Modal::None;
+                }
+                return;
+            }
+            Modal::Confirm { editing, .. } => {
+                // While the path is being typed every key belongs to the input.
+                if editing.is_some() {
+                    self.destination_key(key);
+                    return;
+                }
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
                         if let Modal::Confirm { plan, .. } =
                             std::mem::replace(&mut self.modal, Modal::None)
                         {
                             self.start_install(plan);
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        let current = self
+                            .layout
+                            .as_ref()
+                            .map(|l| l.root.display().to_string())
+                            .unwrap_or_default();
+                        if let Modal::Confirm { editing, .. } = &mut self.modal {
+                            *editing = Some(current);
                         }
                     }
                     _ => self.modal = Modal::None,
@@ -213,6 +299,17 @@ impl App {
                 self.status = "selection cleared".into();
             }
             KeyCode::Enter => self.confirm_install(),
+            KeyCode::Char('e') => self.export_mod_list(),
+            KeyCode::Char('i') => {
+                self.installed_only = !self.installed_only;
+                self.cursor = 0;
+                self.rebuild();
+                self.status = if self.installed_only {
+                    format!("showing the {} mods installed here", self.installed.len())
+                } else {
+                    "showing all mods".into()
+                };
+            }
 
             KeyCode::Char('/') => {
                 self.searching = true;
@@ -236,6 +333,50 @@ impl App {
                 self.spawn_load(true);
             }
             _ => {}
+        }
+    }
+
+    /// Text input for the install destination inside the confirm modal.
+    fn destination_key(&mut self, key: KeyEvent) {
+        let Modal::Confirm { editing, .. } = &mut self.modal else {
+            return;
+        };
+        let Some(buf) = editing else { return };
+        match key.code {
+            KeyCode::Esc => *editing = None,
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            KeyCode::Char(c) => buf.push(c),
+            KeyCode::Enter => {
+                let typed = buf.trim().to_string();
+                *editing = None;
+                self.set_destination(&typed);
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies a new install destination and remembers it for next time.
+    fn set_destination(&mut self, path: &str) {
+        if path.is_empty() {
+            return;
+        }
+        match Layout::resolve(std::path::Path::new(path)) {
+            Ok(layout) => {
+                self.install_dir_hint = layout.plugins().display().to_string();
+                self.layout = Some(layout);
+                self.rescan_installed();
+                self.rebuild();
+
+                let mut cfg = crate::config::Config::load();
+                cfg.install_dir = Some(std::path::PathBuf::from(path));
+                self.status = match cfg.save() {
+                    Ok(()) => format!("installing into {path} (saved for next time)"),
+                    Err(e) => format!("installing into {path} (could not save: {e:#})"),
+                };
+            }
+            Err(e) => self.status = format!("{e:#}"),
         }
     }
 
@@ -364,7 +505,100 @@ impl App {
             return;
         }
         let (plan, missing) = self.index.install_plan(&chosen);
-        self.modal = Modal::Confirm { plan, missing };
+        self.modal = Modal::Confirm {
+            plan,
+            missing,
+            editing: None,
+        };
+    }
+
+    /// Renders the selection as Thunderstore dependency strings and writes them
+    /// to a file, for server images configured with a mod list rather than
+    /// pre-placed plugin files.
+    fn export_mod_list(&mut self) {
+        let chosen = self.chosen();
+        if chosen.is_empty() {
+            self.status = "nothing selected to export".into();
+            return;
+        }
+        let (plan, _) = self.index.install_plan(&chosen);
+
+        // BepInEx itself is the loader, which those images install separately
+        // from their own version setting; listing it as a mod invites a clash.
+        let mut bepinex = None;
+        let mut mods = Vec::new();
+        for &i in &plan {
+            let m = self.index.get(i);
+            let dep = format!("{}-{}", m.full_name, m.version);
+            if m.full_name.starts_with("denikson-BepInExPack") {
+                bepinex = Some(m.version.clone());
+            } else {
+                mods.push(dep);
+            }
+        }
+        let count = mods.len();
+        let joined = mods.join(",");
+
+        let written = write_mod_list(&joined, bepinex.as_deref(), self.export_dir.as_deref())
+            .map(|p| p.display().to_string())
+            .map_err(|e| format!("{e:#}"));
+        self.status = match &written {
+            Ok(p) => format!("exported {count} mods to {p}"),
+            Err(e) => format!("could not write the mod list: {e}"),
+        };
+        // Offer an explicit target file when one is configured or sitting in
+        // the working directory.
+        let target = crate::config::Config::load()
+            .compose_file
+            .filter(|p| p.is_file())
+            .or_else(|| {
+                // Look beside the exported file, which is the working directory
+                // unless a caller overrode it.
+                self.export_dir
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .as_deref()
+                    .and_then(crate::compose::discover)
+            });
+
+        self.modal = Modal::Export {
+            mods: joined,
+            count,
+            bepinex,
+            written,
+            target,
+            applied: None,
+        };
+    }
+
+    /// Writes MODS (and the loader version) into the chosen compose or env file.
+    fn write_mods_to_target(&mut self) {
+        let Modal::Export {
+            mods,
+            bepinex,
+            target,
+            applied,
+            ..
+        } = &mut self.modal
+        else {
+            return;
+        };
+        let Some(path) = target.clone() else { return };
+
+        let mut vars: Vec<(&str, String)> = vec![("MODS", mods.clone())];
+        if let Some(v) = bepinex.clone() {
+            vars.push(("BEPINEXPACK_VERSION", v));
+        }
+        let service = crate::config::Config::load().compose_service;
+
+        let result = crate::compose::write_to_file(&path, service.as_deref(), &vars)
+            .map(|backup| format!("{} (backup: {})", path.display(), backup.display()))
+            .map_err(|e| format!("{e:#}"));
+        self.status = match &result {
+            Ok(w) => format!("wrote MODS into {w}"),
+            Err(e) => format!("could not update the file: {e}"),
+        };
+        *applied = Some(result);
     }
 
     fn start_install(&mut self, plan: Vec<usize>) {
@@ -419,6 +653,42 @@ impl App {
             ))));
         });
     }
+}
+
+/// Writes the dependency list as an env file next to the user, preferring the
+/// working directory and falling back to the config directory.
+fn write_mod_list(
+    mods: &str,
+    bepinex: Option<&str>,
+    preferred: Option<&std::path::Path>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let mut body = String::new();
+    body.push_str("# Generated by valheim-mods-tui.\n");
+    body.push_str("# For server images that install mods themselves, put these\n");
+    body.push_str("# in the environment of your docker-compose service.\n");
+    if let Some(v) = bepinex {
+        body.push_str(&format!("BEPINEXPACK_VERSION={v}\n"));
+    }
+    body.push_str(&format!("MODS={mods}\n"));
+
+    let candidates = [
+        preferred.map(|d| d.join("valheim-mods.env")),
+        std::env::current_dir().ok().map(|d| d.join("valheim-mods.env")),
+        crate::config::config_path()
+            .parent()
+            .map(|d| d.join("valheim-mods.env")),
+    ];
+    let mut last = None;
+    for path in candidates.into_iter().flatten() {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, &body) {
+            Ok(()) => return Ok(path),
+            Err(e) => last = Some(anyhow::anyhow!("{}: {e}", path.display())),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no writable location for the mod list")))
 }
 
 /// Human-readable age for the cached catalogue.

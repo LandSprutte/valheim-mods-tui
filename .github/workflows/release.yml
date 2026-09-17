@@ -1,0 +1,73 @@
+name: release
+
+# Tag a commit to publish binaries that `valheim-mods-tui --update` can install.
+#   git tag v0.2.0 && git push origin v0.2.0
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      # zigbuild supplies the cross-linker for the musl targets; on macOS the
+      # host toolchain already targets aarch64-apple-darwin.
+      - name: Install cross toolchain
+        if: runner.os == 'Linux'
+        run: |
+          pip install ziglang
+          cargo install cargo-zigbuild
+
+      - name: Build
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+
+      # The asset name must carry the target triple: --update matches on it.
+      - name: Stage asset
+        run: cp target/${{ matrix.target }}/release/valheim-mods-tui
+             valheim-mods-tui-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: valheim-mods-tui-${{ matrix.target }}
+          path: valheim-mods-tui-${{ matrix.target }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          chmod +x valheim-mods-tui-*
+          gh release create "$TAG" --repo "$REPO" --title "$TAG" --generate-notes \
+            valheim-mods-tui-* || \
+          gh release upload "$TAG" --repo "$REPO" --clobber valheim-mods-tui-*
