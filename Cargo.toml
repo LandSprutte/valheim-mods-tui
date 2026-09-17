@@ -1,0 +1,15 @@
+[package]
+name = "valheim-mods-tui"
+version = "0.1.0"
+edition = "2021"
+description = "TUI for browsing and installing Valheim 1.0 mods from Thunderstore"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+reqwest = { version = "0.12", features = ["blocking", "gzip", "json", "rustls-tls"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+anyhow = "1"
+dirs = "5"
