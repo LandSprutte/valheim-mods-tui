@@ -56,8 +56,127 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             target.as_deref(),
             applied.as_ref(),
         ),
+        Modal::Setup {
+            problem,
+            found,
+            cursor,
+            editing,
+        } => setup_modal(f, problem, found, *cursor, editing.as_deref()),
         Modal::None => {}
     }
+}
+
+/// Startup prompt shown when the Valheim folder is unset or has no BepInEx.
+fn setup_modal(
+    f: &mut Frame,
+    problem: &str,
+    found: &[crate::detect::Install],
+    cursor: usize,
+    editing: Option<&str>,
+) {
+    let mut lines = vec![Line::raw("")];
+    for line in problem.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            Style::new().fg(WARN),
+        )));
+    }
+    lines.push(Line::raw(""));
+
+    if let Some(buf) = editing {
+        lines.push(Line::from(vec![
+            Span::styled("  folder  ", Style::new().fg(DIM)),
+            Span::styled(buf.to_string(), Style::new().fg(Color::White)),
+            Span::styled("▏", Style::new().fg(ACCENT)),
+        ]));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            "  the Valheim folder, its BepInEx dir, or a plugins dir",
+            Style::new().fg(DIM).italic(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  enter accepts · esc goes back",
+            Style::new().fg(DIM).italic(),
+        )));
+    } else if found.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  Nothing found in the usual places for this system.",
+            Style::new().fg(Color::Gray),
+        )));
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  p ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+            Span::styled(" type the folder yourself    ", Style::new().fg(Color::Gray)),
+            Span::styled(" esc ", Style::new().fg(Color::Black).bg(DIM)),
+            Span::styled(" browse without installing", Style::new().fg(DIM)),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Found these — pick one:",
+            Style::new().fg(Color::Gray),
+        )));
+        for (n, install) in found.iter().enumerate().take(8) {
+            let here = n == cursor;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if here { "  ▌ " } else { "    " },
+                    Style::new().fg(ACCENT),
+                ),
+                Span::styled(
+                    if install.has_bepinex { "● " } else { "○ " },
+                    Style::new().fg(if install.has_bepinex { GOOD } else { DIM }),
+                ),
+                Span::styled(
+                    install.path.display().to_string(),
+                    Style::new().fg(if here { ACCENT } else { Color::Gray }).bold(),
+                ),
+                Span::styled(
+                    format!("  {}", install.label),
+                    Style::new().fg(DIM),
+                ),
+                Span::styled(
+                    if install.has_bepinex {
+                        String::new()
+                    } else {
+                        "  no BepInEx yet".to_string()
+                    },
+                    Style::new().fg(WARN),
+                ),
+            ]));
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  j/k ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+            Span::styled(" move   ", Style::new().fg(DIM)),
+            Span::styled(" enter ", Style::new().fg(Color::Black).bg(GOOD).bold()),
+            Span::styled(" use it   ", Style::new().fg(DIM)),
+            Span::styled(" p ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+            Span::styled(" type a path   ", Style::new().fg(DIM)),
+            Span::styled(" esc ", Style::new().fg(Color::Black).bg(DIM)),
+            Span::styled(" skip", Style::new().fg(DIM)),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "  BepInEx does not have to exist yet — installing a mod puts it there.",
+        Style::new().fg(DIM).italic(),
+    )));
+
+    let area = centered(f, 92, lines.len() as u16 + 2);
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(WARN))
+                .title(Span::styled(
+                    " where is Valheim? ",
+                    Style::new().fg(WARN).bold(),
+                )),
+        ),
+        area,
+    );
 }
 
 fn header(f: &mut Frame, area: Rect, app: &App) {
@@ -435,13 +554,13 @@ fn help_modal(f: &mut Frame) {
         ("j / k / ↓ / ↑", "move up and down the list"),
         ("l / → / tab", "expand a mod's dependency tree"),
         ("h / ←", "collapse, or jump to the parent mod"),
-        ("g / G", "jump to the top or bottom"),
-        ("ctrl-d / ctrl-u", "half-page down and up"),
+        ("g / G · ctrl-d/u", "jump to the ends · half-page down and up"),
         ("space", "select or deselect the mod"),
         ("c", "clear the whole selection"),
         ("enter", "install selection plus dependencies"),
         ("e", "export the selection as a MODS= list"),
         ("i", "show only mods already installed here"),
+        ("S", "change the Valheim folder"),
         ("/", "search name, author and description"),
         ("f", "cycle the 1.0 compatibility filter"),
         ("s", "cycle sort: downloads, rating, updated, name"),

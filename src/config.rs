@@ -30,14 +30,23 @@ pub fn config_path() -> PathBuf {
 
 impl Config {
     pub fn load() -> Self {
-        std::fs::read(config_path())
+        Self::load_from(&config_path())
+    }
+
+    /// Reads a config from an explicit path, so callers (and tests) are never
+    /// forced through the user's real config file.
+    pub fn load_from(path: &Path) -> Self {
+        std::fs::read(path)
             .ok()
             .and_then(|raw| serde_json::from_slice(&raw).ok())
             .unwrap_or_default()
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }

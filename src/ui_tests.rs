@@ -155,7 +155,7 @@ fn enter_opens_a_confirmation_listing_dependencies() {
     // An install directory is required before anything can be written.
     app.on_key(key(KeyCode::Enter));
     assert!(matches!(app.modal, Modal::None));
-    assert!(app.status.contains("--install-dir"), "got: {}", app.status);
+    assert!(app.status.contains("press S to choose one"), "got: {}", app.status);
 
     let dir = std::env::temp_dir().join(format!("vmt-ui-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -185,6 +185,118 @@ fn enter_opens_a_confirmation_listing_dependencies() {
 }
 
 #[test]
+fn startup_prompts_when_no_folder_is_configured() {
+    let mut app = App::blank(None, String::new());
+    app.check_setup();
+    match &app.modal {
+        Modal::Setup { problem, .. } => {
+            assert!(problem.contains("No Valheim folder is configured"), "got: {problem}")
+        }
+        _ => panic!("expected the setup prompt"),
+    }
+    app.handle_msg(Msg::Catalog(Ok(vec![m("Dev-A", &[], 1)])));
+    let out = screen(&mut app);
+    assert!(out.contains("where is Valheim?"), "{out}");
+    // Bootstrapping must stay possible: a missing BepInEx is not a dead end.
+    assert!(out.contains("does not have to exist yet"), "{out}");
+}
+
+#[test]
+fn startup_prompts_when_the_configured_folder_has_no_bepinex() {
+    let dir = std::env::temp_dir().join(format!("vmt-setup-a-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let mut app = App::blank(
+        Some(crate::config::Layout::resolve(&dir).unwrap()),
+        "set".into(),
+    );
+    app.check_setup();
+    match &app.modal {
+        Modal::Setup { problem, .. } => assert!(problem.contains("No BepInEx"), "got: {problem}"),
+        _ => panic!("a folder without BepInEx should raise the prompt"),
+    }
+
+    // With BepInEx present the prompt stays out of the way.
+    std::fs::create_dir_all(dir.join("BepInEx").join("plugins")).unwrap();
+    let mut ok = App::blank(
+        Some(crate::config::Layout::resolve(&dir).unwrap()),
+        "set".into(),
+    );
+    ok.check_setup();
+    assert!(matches!(ok.modal, Modal::None), "a valid install must not prompt");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn startup_prompts_when_the_configured_folder_has_vanished() {
+    let dir = std::env::temp_dir().join(format!("vmt-setup-b-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let layout = crate::config::Layout::resolve(&dir).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let mut app = App::blank(Some(layout), "set".into());
+    app.check_setup();
+    match &app.modal {
+        Modal::Setup { problem, .. } => {
+            assert!(problem.contains("no longer exists"), "got: {problem}")
+        }
+        _ => panic!("a vanished folder should raise the prompt"),
+    }
+}
+
+#[test]
+fn a_folder_typed_into_the_setup_prompt_is_adopted() {
+    let dir = std::env::temp_dir().join(format!("vmt-setup-c-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("BepInEx").join("plugins")).unwrap();
+
+    let mut app = App::blank(None, String::new());
+    app.config_file = dir.join("config.json");
+    app.check_setup();
+    app.on_key(key(KeyCode::Char('p')));
+    for c in dir.display().to_string().chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Enter));
+
+    assert!(matches!(app.modal, Modal::None), "a good path closes the prompt");
+    assert_eq!(app.layout.as_ref().unwrap().root, dir);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn an_unusable_path_keeps_the_setup_prompt_open() {
+    let mut app = App::blank(None, String::new());
+    app.check_setup();
+    app.on_key(key(KeyCode::Char('p')));
+    for c in "/no/such/valheim".chars() {
+        app.on_key(key(KeyCode::Char(c)));
+    }
+    app.on_key(key(KeyCode::Enter));
+
+    assert!(app.layout.is_none());
+    assert!(
+        matches!(app.modal, Modal::Setup { .. }),
+        "the user must not be dropped into a broken state"
+    );
+}
+
+#[test]
+fn the_setup_prompt_can_be_skipped_to_browse() {
+    let mut app = App::blank(None, String::new());
+    app.check_setup();
+    app.on_key(key(KeyCode::Esc));
+    assert!(matches!(app.modal, Modal::None));
+    assert!(!app.quit, "esc must not quit the whole app");
+    assert!(app.status.contains("browsing only"), "got: {}", app.status);
+
+    // And it can be summoned back.
+    app.on_key(key(KeyCode::Char('S')));
+    assert!(matches!(app.modal, Modal::Setup { .. }));
+}
+
+#[test]
 fn the_install_destination_can_be_changed_from_the_confirm_modal() {
     let first = std::env::temp_dir().join(format!("vmt-dest-a-{}", std::process::id()));
     let second = std::env::temp_dir().join(format!("vmt-dest-b-{}", std::process::id()));
@@ -192,6 +304,7 @@ fn the_install_destination_can_be_changed_from_the_confirm_modal() {
     std::fs::create_dir_all(&second).unwrap();
 
     let mut app = app();
+    app.config_file = first.join("config.json");
     app.layout = Some(crate::config::Layout::resolve(&first).unwrap());
     app.on_key(key(KeyCode::Char(' ')));
     app.on_key(key(KeyCode::Enter));
@@ -227,6 +340,7 @@ fn a_bad_destination_is_reported_and_the_old_one_kept() {
     let good = std::env::temp_dir().join(format!("vmt-dest-c-{}", std::process::id()));
     std::fs::create_dir_all(&good).unwrap();
     let mut app = app();
+    app.config_file = good.join("config.json");
     app.layout = Some(crate::config::Layout::resolve(&good).unwrap());
     app.on_key(key(KeyCode::Char(' ')));
     app.on_key(key(KeyCode::Enter));
@@ -250,6 +364,7 @@ fn typing_a_destination_never_triggers_the_install() {
     let dir = std::env::temp_dir().join(format!("vmt-dest-d-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let mut app = app();
+    app.config_file = dir.join("config.json");
     app.layout = Some(crate::config::Layout::resolve(&dir).unwrap());
     app.on_key(key(KeyCode::Char(' ')));
     app.on_key(key(KeyCode::Enter));
@@ -279,6 +394,7 @@ fn w_writes_the_mod_list_into_a_compose_file() {
 
     let mut app = App::blank(None, "unset".into());
     app.export_dir = Some(dir.clone());
+    app.config_file = dir.join("config.json");
     let mut jotunn = m("ValheimModding-Jotunn", &[], 999);
     jotunn.version = "2.30.0".into();
     app.handle_msg(Msg::Catalog(Ok(vec![jotunn])));

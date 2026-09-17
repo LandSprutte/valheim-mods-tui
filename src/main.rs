@@ -3,6 +3,7 @@
 mod app;
 mod compose;
 mod config;
+mod detect;
 mod index;
 mod install;
 mod installed;
@@ -156,7 +157,9 @@ fn main() -> Result<()> {
         .or_else(|| cfg.install_dir.clone());
 
     let mut layout = None;
-    let mut hint = String::from("none configured");
+    // Empty means nothing was configured at all, as opposed to configured but
+    // unusable — the two need different advice.
+    let mut hint = String::new();
     if let Some(dir) = &chosen {
         match Layout::resolve(dir) {
             Ok(l) => {
@@ -188,7 +191,29 @@ fn main() -> Result<()> {
                 println!("plugins dir:  {}", l.plugins().display());
                 println!("bepinex:      {}", if l.bepinex_present() { "present" } else { "not installed yet" });
             }
-            None => println!("install dir:  {hint}"),
+            None => println!(
+                "install dir:  {}",
+                if hint.is_empty() { "not configured" } else { &hint }
+            ),
+        }
+        let found = detect::detect();
+        if found.is_empty() {
+            println!("detected:     nothing in the usual places for this system");
+        } else {
+            println!("detected:");
+            for install in found {
+                println!(
+                    "  {} {}  ({}{})",
+                    if install.has_bepinex { "●" } else { "○" },
+                    install.path.display(),
+                    install.label,
+                    if install.has_bepinex {
+                        ""
+                    } else {
+                        ", no BepInEx"
+                    }
+                );
+            }
         }
         return Ok(());
     }

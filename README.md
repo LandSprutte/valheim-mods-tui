@@ -94,6 +94,7 @@ git tag v0.2.0 && git push origin v0.2.0
 | `e` | export the selection as a `MODS=` list |
 | `w` | *(in the export dialog)* write `MODS` into your compose or `.env` file |
 | `i` | show only mods already installed here |
+| `S` | change the Valheim folder |
 | `/` | search name, author and description |
 | `f` | cycle the 1.0 compatibility filter |
 | `s` | sort by downloads, rating, updated or name |
@@ -183,6 +184,44 @@ take effect — with no error to tell you so. Point your unit at
 update) or export those four variables in your own script.
 
 Restart the server after installing. Mods are only read at startup.
+
+## Finding your Valheim folder
+
+On startup the configured folder is validated. If it is unset, gone, or has no
+BepInEx in it, the TUI says so and offers what it found:
+
+```
+┌ where is Valheim? ──────────────────────────────────────────────────────┐
+│  No Valheim folder is configured yet.                                   │
+│                                                                         │
+│  Found these — pick one:                                                │
+│  ▌ ● ~/Library/Application Support/Steam/steamapps/common/Valheim       │
+│    ○ /opt/valheim  dedicated server  no BepInEx yet                     │
+│                                                                         │
+│  j/k  move    enter  use it    p  type a path    esc  skip              │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+Detection covers the usual locations per platform:
+
+- **Windows** — `C:\Program Files (x86)\Steam\steamapps\common\Valheim`,
+  the `Valheim dedicated server` folder, and Steam libraries on other drives
+  read from `libraryfolders.vdf`.
+- **macOS** — `~/Library/Application Support/Steam/steamapps/common/Valheim`.
+- **Linux** — `~/.steam/steam`, `~/.local/share/Steam`, `~/.steam/root`, the
+  snap location, plus server conventions like `/opt/valheim`, `/srv/valheim`,
+  `/home/steam/valheim` and `~/valheim`.
+
+A folder counts as Valheim when it holds `valheim_server.x86_64`,
+`valheim.exe`, a `*_Data` directory, or an existing `BepInEx`. Entries that
+already have BepInEx (`●`) sort first, since that is nearly always the one you
+mean.
+
+**A missing BepInEx is a warning, not a wall.** You can still pick a folder
+without it — installing any mod puts BepInEx there, which is how a fresh server
+gets bootstrapped. `esc` skips the prompt to browse without installing, and `S`
+brings it back at any time. `--print-config` prints the same detection results
+for diagnosing a headless server.
 
 ## Seeing what is already installed
 

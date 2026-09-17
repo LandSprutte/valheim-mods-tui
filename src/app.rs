@@ -3,6 +3,7 @@
 use crate::config::Layout;
 use crate::index::{build_rows, Filter, Index, Row, Sort};
 use crate::install;
+use crate::detect::{self, Install};
 use crate::installed::{self, Installed};
 use crate::thunderstore::{self, Mod};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -39,6 +40,14 @@ pub enum Modal {
         /// Outcome of writing to that target, once attempted.
         applied: Option<Result<String, String>>,
     },
+    /// Shown at startup when the install directory is unset or unusable.
+    Setup {
+        problem: String,
+        found: Vec<Install>,
+        cursor: usize,
+        /// Set while a path is being typed by hand.
+        editing: Option<String>,
+    },
 }
 
 pub struct App {
@@ -62,6 +71,8 @@ pub struct App {
     pub install_dir_hint: String,
     /// Where the exported mod list is written; the working directory by default.
     pub export_dir: Option<std::path::PathBuf>,
+    /// The config file settings are persisted to.
+    pub config_file: std::path::PathBuf,
     /// Mods already present in the configured install, by full name.
     pub installed: HashMap<String, Installed>,
     /// Restrict the list to mods that are already installed.
@@ -77,6 +88,7 @@ impl App {
     pub fn new(layout: Option<Layout>, install_dir_hint: String) -> Self {
         let mut app = App::blank(layout, install_dir_hint);
         app.rescan_installed();
+        app.check_setup();
         app.spawn_load(false);
         app
     }
@@ -102,6 +114,7 @@ impl App {
             layout,
             install_dir_hint,
             export_dir: None,
+            config_file: crate::config::config_path(),
             installed: HashMap::new(),
             installed_only: false,
             quit: false,
@@ -119,6 +132,37 @@ impl App {
             let res = thunderstore::load(force).map_err(|e| format!("{e:#}"));
             let _ = tx.send(Msg::Catalog(res));
         });
+    }
+
+    /// Validates the configured install directory, raising the setup prompt
+    /// when it is missing, unusable, or has no BepInEx in it.
+    pub fn check_setup(&mut self) {
+        let problem = match &self.layout {
+            None if self.install_dir_hint.is_empty() => {
+                Some("No Valheim folder is configured yet.".to_string())
+            }
+            None => Some(format!(
+                "The configured Valheim folder cannot be used:\n  {}",
+                self.install_dir_hint
+            )),
+            Some(l) if !l.root.is_dir() => Some(format!(
+                "The configured folder no longer exists:\n  {}",
+                l.root.display()
+            )),
+            Some(l) if !l.bepinex_present() => Some(format!(
+                "No BepInEx found in the configured folder:\n  {}",
+                l.root.display()
+            )),
+            Some(_) => None,
+        };
+        let Some(problem) = problem else { return };
+
+        self.modal = Modal::Setup {
+            problem,
+            found: detect::detect(),
+            cursor: 0,
+            editing: None,
+        };
     }
 
     /// Re-reads the install directory. Cheap enough to run after every install.
@@ -227,6 +271,10 @@ impl App {
                 self.modal = Modal::None;
                 return;
             }
+            Modal::Setup { .. } => {
+                self.setup_key(key);
+                return;
+            }
             Modal::Export { target, .. } => {
                 // `w` commits the list to the compose or env file.
                 if matches!(key.code, KeyCode::Char('w')) && target.is_some() {
@@ -300,6 +348,17 @@ impl App {
             }
             KeyCode::Enter => self.confirm_install(),
             KeyCode::Char('e') => self.export_mod_list(),
+            KeyCode::Char('S') => {
+                self.modal = Modal::Setup {
+                    problem: match &self.layout {
+                        Some(l) => format!("Currently installing into\n  {}", l.root.display()),
+                        None => "No Valheim folder is configured.".into(),
+                    },
+                    found: detect::detect(),
+                    cursor: 0,
+                    editing: None,
+                };
+            }
             KeyCode::Char('i') => {
                 self.installed_only = !self.installed_only;
                 self.cursor = 0;
@@ -331,6 +390,69 @@ impl App {
             KeyCode::Char('r') if !self.loading => {
                 self.status = "refreshing catalogue…".into();
                 self.spawn_load(true);
+            }
+            _ => {}
+        }
+    }
+
+    /// Choosing a Valheim folder from the startup prompt.
+    fn setup_key(&mut self, key: KeyEvent) {
+        let Modal::Setup {
+            found,
+            cursor,
+            editing,
+            ..
+        } = &mut self.modal
+        else {
+            return;
+        };
+
+        // While typing, every key belongs to the input.
+        if let Some(buf) = editing {
+            match key.code {
+                KeyCode::Esc => *editing = None,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) => buf.push(c),
+                KeyCode::Enter => {
+                    let typed = buf.trim().to_string();
+                    self.modal = Modal::None;
+                    self.set_destination(&typed);
+                    // A path that did not resolve leaves the prompt up.
+                    if self.layout.is_none() {
+                        self.check_setup();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let count = found.len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down if count > 0 => {
+                *cursor = (*cursor + 1).min(count - 1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => *cursor = cursor.saturating_sub(1),
+            KeyCode::Enter if count > 0 => {
+                let chosen = found[*cursor].path.display().to_string();
+                self.modal = Modal::None;
+                self.set_destination(&chosen);
+            }
+            KeyCode::Char('p') | KeyCode::Char('e') => {
+                *editing = Some(
+                    self.layout
+                        .as_ref()
+                        .map(|l| l.root.display().to_string())
+                        .unwrap_or_default(),
+                )
+            }
+            // Browsing without a target is legitimate; installing is not.
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.modal = Modal::None;
+                self.status =
+                    "no install folder set — browsing only, press S to set one".into();
             }
             _ => {}
         }
@@ -369,9 +491,9 @@ impl App {
                 self.rescan_installed();
                 self.rebuild();
 
-                let mut cfg = crate::config::Config::load();
+                let mut cfg = crate::config::Config::load_from(&self.config_file);
                 cfg.install_dir = Some(std::path::PathBuf::from(path));
-                self.status = match cfg.save() {
+                self.status = match cfg.save_to(&self.config_file) {
                     Ok(()) => format!("installing into {path} (saved for next time)"),
                     Err(e) => format!("installing into {path} (could not save: {e:#})"),
                 };
@@ -493,10 +615,8 @@ impl App {
             return;
         }
         if self.layout.is_none() {
-            self.status = format!(
-                "no install directory set — pass --install-dir <valheim server root> ({})",
-                self.install_dir_hint
-            );
+            self.status =
+                "no Valheim folder set — press S to choose one".to_string();
             return;
         }
         let chosen = self.chosen();
@@ -548,7 +668,7 @@ impl App {
         };
         // Offer an explicit target file when one is configured or sitting in
         // the working directory.
-        let target = crate::config::Config::load()
+        let target = crate::config::Config::load_from(&self.config_file)
             .compose_file
             .filter(|p| p.is_file())
             .or_else(|| {
@@ -589,7 +709,7 @@ impl App {
         if let Some(v) = bepinex.clone() {
             vars.push(("BEPINEXPACK_VERSION", v));
         }
-        let service = crate::config::Config::load().compose_service;
+        let service = crate::config::Config::load_from(&self.config_file).compose_service;
 
         let result = crate::compose::write_to_file(&path, service.as_deref(), &vars)
             .map(|backup| format!("{} (backup: {})", path.display(), backup.display()))
