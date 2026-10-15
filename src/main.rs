@@ -7,6 +7,7 @@ mod detect;
 mod index;
 mod install;
 mod installed;
+mod loader;
 mod thunderstore;
 mod update;
 mod ui;
@@ -189,7 +190,18 @@ fn main() -> Result<()> {
             Some(l) => {
                 println!("server root:  {}", l.root.display());
                 println!("plugins dir:  {}", l.plugins().display());
-                println!("bepinex:      {}", if l.bepinex_present() { "present" } else { "not installed yet" });
+                println!(
+                    "bepinex:      {}",
+                    if l.bepinex_present() {
+                        "present"
+                    } else {
+                        "not installed yet"
+                    }
+                );
+                let info = loader::detect(&l.root);
+                println!("game build:   {:?}", info.build);
+                println!("loader:       {}", info.hook);
+                println!("launch:       {}", info.launch);
             }
             None => println!(
                 "install dir:  {}",

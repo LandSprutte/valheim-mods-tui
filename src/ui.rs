@@ -158,6 +158,18 @@ fn setup_modal(
     }
 
     lines.push(Line::raw(""));
+    // Say which loader the highlighted install will actually use, since the
+    // BepInEx pack contains all of them and only one is live.
+    if editing.is_none() {
+        if let Some(install) = found.get(cursor) {
+            let info = crate::loader::detect(&install.path);
+            lines.push(Line::from(vec![
+                Span::styled("  loader  ", Style::new().fg(DIM)),
+                Span::styled(info.hook.to_string(), Style::new().fg(ACCENT)),
+                Span::styled(format!("  ·  {}", info.launch), Style::new().fg(Color::Gray)),
+            ]));
+        }
+    }
     lines.push(Line::from(Span::styled(
         "  BepInEx does not have to exist yet — installing a mod puts it there.",
         Style::new().fg(DIM).italic(),

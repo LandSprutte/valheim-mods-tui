@@ -342,6 +342,7 @@ mod tests {
             "x86_64-unknown-linux-musl",
             "aarch64-unknown-linux-musl",
             "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
         ]
         .iter()
         .map(|t| (format!("valheim-mods-tui-{t}"), format!("url/{t}")))
@@ -351,6 +352,7 @@ mod tests {
             "x86_64-unknown-linux-musl",
             "aarch64-unknown-linux-musl",
             "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
         ] {
             let hit = asset_for_target(&published, t)
                 .unwrap_or_else(|| panic!("no asset resolved for {t}"));

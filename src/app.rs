@@ -137,6 +137,19 @@ impl App {
     /// Validates the configured install directory, raising the setup prompt
     /// when it is missing, unusable, or has no BepInEx in it.
     pub fn check_setup(&mut self) {
+        // Correct a launch script that targets the wrong platform. The pack
+        // hardcodes the Linux executable name, which leaves a Mac install with
+        // BepInEx present but unable to start.
+        if let Some(layout) = &self.layout {
+            if layout.bepinex_present() {
+                let (_, note) = crate::loader::configure(&layout.root);
+                if let Some(note) = note {
+                    self.status = note.clone();
+                    self.log.push(note);
+                }
+            }
+        }
+
         let problem = match &self.layout {
             None if self.install_dir_hint.is_empty() => {
                 Some("No Valheim folder is configured yet.".to_string())
@@ -767,9 +780,20 @@ impl App {
             } else {
                 String::new()
             };
+
+            // The BepInEx pack ships every platform's loader at once, so once
+            // it is on disk, work out which one this install actually uses and
+            // fix up the launch script if the platform needs it.
+            let (info, note) = crate::loader::configure(&layout.root);
+            if let Some(note) = note {
+                log(format!("  {note}"));
+            }
+            log(format!("  loader for this install: {}", info.hook));
+
             let _ = tx.send(Msg::InstallDone(Ok(format!(
-                "installed {installed} mods into {}{kept} — restart the server to load them",
-                layout.plugins().display()
+                "installed {installed} mods into {}{kept} — {}",
+                layout.plugins().display(),
+                info.launch
             ))));
         });
     }

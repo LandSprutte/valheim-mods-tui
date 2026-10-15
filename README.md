@@ -70,13 +70,25 @@ on Linux. If any step fails, the staged file is removed and the current binary
 is untouched. Installing into a system directory needs the usual privileges;
 the error says so rather than failing obscurely.
 
-If you publish via GitHub, `.github/workflows/release.yml` builds all three
-targets and uploads them under the names `--update` looks for. Push a tag to
-trigger it:
+If you publish via GitHub, `.github/workflows/release.yml` builds all four
+targets (x86_64/aarch64 Linux, Apple Silicon/Intel macOS) and uploads them
+under the names `--update` looks for. Push a tag to trigger it:
 
 ```sh
 git tag v0.2.0 && git push origin v0.2.0
 ```
+
+To build the same binaries locally and publish them yourself:
+
+```sh
+./scripts/build-release.sh            # writes dist/ for this host's platforms
+./scripts/build-release.sh --tag v0.2.0   # build and create the GitHub release
+```
+
+Output is `dist/valheim-mods-tui-<target-triple>` plus `SHA256SUMS`. Linux
+builds are static musl binaries (via `zig` + `cargo-zigbuild`); Apple builds
+require a macOS host. The script prints install hints if a toolchain piece is
+missing.
 
 ## Keys
 
