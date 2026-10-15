@@ -1,6 +1,6 @@
 [package]
 name = "valheim-mods-tui"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "TUI for browsing and installing Valheim 1.0 mods from Thunderstore"
 

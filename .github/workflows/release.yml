@@ -23,6 +23,8 @@ jobs:
             os: macos-latest
           - target: x86_64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,15 +32,18 @@ jobs:
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
-      # zigbuild supplies the cross-linker for the musl targets; on macOS the
-      # host toolchain already targets aarch64-apple-darwin.
+      # zigbuild supplies the cross-linker for the musl targets; on macOS and
+      # Windows the host toolchain builds the host target natively.
       - name: Install cross toolchain
         if: runner.os == 'Linux'
         run: |
           pip install ziglang
           cargo install cargo-zigbuild
 
+      # bash is used on every runner so the same script runs on Windows, where
+      # the default shell would be PowerShell.
       - name: Build
+        shell: bash
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             cargo zigbuild --release --target ${{ matrix.target }}
@@ -47,14 +52,19 @@ jobs:
           fi
 
       # The asset name must carry the target triple: --update matches on it.
+      # Windows binaries need the .exe suffix to be runnable when downloaded.
       - name: Stage asset
-        run: cp target/${{ matrix.target }}/release/valheim-mods-tui
-             valheim-mods-tui-${{ matrix.target }}
+        shell: bash
+        run: |
+          ext=""
+          if [ "${{ runner.os }}" = "Windows" ]; then ext=".exe"; fi
+          cp "target/${{ matrix.target }}/release/valheim-mods-tui${ext}" \
+             "valheim-mods-tui-${{ matrix.target }}${ext}"
 
       - uses: actions/upload-artifact@v4
         with:
           name: valheim-mods-tui-${{ matrix.target }}
-          path: valheim-mods-tui-${{ matrix.target }}
+          path: valheim-mods-tui-${{ matrix.target }}*
 
   publish:
     needs: build

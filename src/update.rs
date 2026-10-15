@@ -44,6 +44,8 @@ pub fn asset_for_target<'a>(assets: &'a [(String, String)], target: &str) -> Opt
         "linux"
     } else if target.contains("apple") || target.contains("darwin") {
         "darwin"
+    } else if target.contains("windows") {
+        "windows"
     } else {
         return None;
     };
@@ -77,6 +79,16 @@ pub fn is_newer(current: &str, remote: &str) -> bool {
     false
 }
 
+/// True when `bytes` is a Windows PE image: an "MZ" stub whose header at
+/// `e_lfanew` carries the "PE\0\0" signature.
+fn is_pe(bytes: &[u8]) -> bool {
+    if bytes.len() < 0x40 || &bytes[..2] != b"MZ" {
+        return false;
+    }
+    let off = u32::from_le_bytes([bytes[0x3c], bytes[0x3d], bytes[0x3e], bytes[0x3f]]) as usize;
+    bytes.get(off..off + 4) == Some(b"PE\0\0")
+}
+
 /// Rejects payloads that are not a native executable for this platform.
 ///
 /// Without this a rate-limit page or an HTML error would be written straight
@@ -91,12 +103,15 @@ pub fn looks_like_executable(bytes: &[u8]) -> bool {
         magic,
         [0xfe, 0xed, 0xfa, 0xcf] | [0xcf, 0xfa, 0xed, 0xfe] | [0xca, 0xfe, 0xba, 0xbe]
     );
+    let pe = is_pe(bytes);
     if cfg!(target_os = "linux") {
         elf
     } else if cfg!(target_os = "macos") {
         macho
+    } else if cfg!(target_os = "windows") {
+        pe
     } else {
-        elf || macho
+        elf || macho || pe
     }
 }
 
@@ -150,15 +165,21 @@ fn github_release(
 ///
 /// The replacement is staged beside the target and renamed into place, which is
 /// atomic and is also the only way to overwrite a running executable — writing
-/// to it directly fails with ETXTBSY on Linux.
+/// to it directly fails with ETXTBSY on Linux. Windows is stricter still: a
+/// running image cannot be replaced at all, so it is moved aside first and the
+/// leftover removed on a later run.
 fn replace_binary(exe: &Path, bytes: &[u8]) -> Result<()> {
     let dir = exe
         .parent()
         .ok_or_else(|| anyhow!("cannot locate the directory of {}", exe.display()))?;
-    let staged = dir.join(format!(
-        ".{}.update",
-        exe.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    let file_name = exe.file_name().unwrap_or_default().to_string_lossy().to_string();
+
+    // Windows will not run a staged file without the .exe suffix, and will not
+    // overwrite a running image in place — only move it aside.
+    #[cfg(windows)]
+    let staged = dir.join(format!(".{file_name}.update.exe"));
+    #[cfg(not(windows))]
+    let staged = dir.join(format!(".{file_name}.update"));
 
     let write = || -> Result<()> {
         std::fs::write(&staged, bytes)?;
@@ -196,6 +217,7 @@ fn replace_binary(exe: &Path, bytes: &[u8]) -> Result<()> {
         }
     }
 
+    #[cfg(not(windows))]
     if let Err(e) = std::fs::rename(&staged, exe) {
         let _ = std::fs::remove_file(&staged);
         return Err(e).with_context(|| {
@@ -204,6 +226,27 @@ fn replace_binary(exe: &Path, bytes: &[u8]) -> Result<()> {
                 exe.display()
             )
         });
+    }
+
+    #[cfg(windows)]
+    {
+        // A running image cannot be deleted or overwritten on Windows, but it
+        // can be renamed. Move it aside, slot the new build in, then try to
+        // remove the old one — it stays locked until this process exits, so a
+        // failure here is expected and it is cleaned up on the next run.
+        let old = dir.join(format!(".{file_name}.old"));
+        let _ = std::fs::remove_file(&old);
+        if let Err(e) = std::fs::rename(exe, &old) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(e)
+                .with_context(|| format!("moving {} aside for replacement", exe.display()));
+        }
+        if let Err(e) = std::fs::rename(&staged, exe) {
+            let _ = std::fs::rename(&old, exe);
+            let _ = std::fs::remove_file(&staged);
+            return Err(e).with_context(|| format!("replacing {}", exe.display()));
+        }
+        let _ = std::fs::remove_file(&old);
     }
     Ok(())
 }
@@ -216,6 +259,13 @@ pub fn run(source: &str, force: bool) -> Result<()> {
         .context("locating the running binary")?
         .canonicalize()
         .context("resolving the path of the running binary")?;
+
+    // A previous Windows update leaves the old image beside the new one until
+    // it stops running; this process is new, so remove it while we can.
+    #[cfg(windows)]
+    if let (Some(dir), Some(name)) = (exe.parent(), exe.file_name().and_then(|n| n.to_str())) {
+        let _ = std::fs::remove_file(dir.join(format!(".{name}.old")));
+    }
 
     println!("current version {VERSION} ({TARGET})");
 
@@ -334,18 +384,19 @@ mod tests {
     }
 
     /// Guards the contract with .github/workflows/release.yml, which names each
-    /// asset "valheim-mods-tui-<triple>". If that naming drifts, --update
-    /// silently stops finding builds.
+    /// asset "valheim-mods-tui-<triple>" (with .exe on Windows). If that naming
+    /// drifts, --update silently stops finding builds.
     #[test]
     fn release_workflow_asset_names_resolve() {
         let published: Vec<(String, String)> = [
-            "x86_64-unknown-linux-musl",
-            "aarch64-unknown-linux-musl",
-            "aarch64-apple-darwin",
-            "x86_64-apple-darwin",
+            ("x86_64-unknown-linux-musl", ""),
+            ("aarch64-unknown-linux-musl", ""),
+            ("aarch64-apple-darwin", ""),
+            ("x86_64-apple-darwin", ""),
+            ("x86_64-pc-windows-msvc", ".exe"),
         ]
         .iter()
-        .map(|t| (format!("valheim-mods-tui-{t}"), format!("url/{t}")))
+        .map(|(t, ext)| (format!("valheim-mods-tui-{t}{ext}"), format!("url/{t}")))
         .collect();
 
         for t in [
@@ -358,11 +409,34 @@ mod tests {
                 .unwrap_or_else(|| panic!("no asset resolved for {t}"));
             assert_eq!(hit.0, format!("valheim-mods-tui-{t}"));
         }
+        // The Windows asset carries an .exe suffix but must still resolve by
+        // triple, and a gnu build must accept the published msvc binary.
+        assert_eq!(
+            asset_for_target(&published, "x86_64-pc-windows-msvc").unwrap().0,
+            "valheim-mods-tui-x86_64-pc-windows-msvc.exe"
+        );
+        assert!(asset_for_target(&published, "x86_64-pc-windows-gnu").is_some());
         // The triple this build targets must resolve too.
         assert!(
             asset_for_target(&published, TARGET).is_some(),
             "no release asset would match this build's target {TARGET}"
         );
+    }
+
+    #[test]
+    fn windows_images_are_recognised_by_signature() {
+        let mut pe = vec![0u8; 0x80];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3c] = 0x40;
+        pe[0x40..0x44].copy_from_slice(b"PE\0\0");
+        assert!(is_pe(&pe));
+        assert!(!is_pe(b"MZ"), "too short to carry a header");
+        assert!(!is_pe(b"not a pe image at all"));
+        // A correct MZ stub whose signature offset points past the end.
+        let mut truncated = pe.clone();
+        truncated[0x3c] = 0x7e;
+        assert!(!is_pe(&truncated));
     }
 
     #[test]
